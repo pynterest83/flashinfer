@@ -342,21 +342,115 @@ __device__ __forceinline__ void load_kv(typename KTraits::SharedStorage* smem_st
   }
 }
 
+// FP8 KV path: how repack_fp8_kv_to_bf16 applies the dequant scales. The choice is
+// made once per launch (it depends only on kernel parameters, so it is uniform
+// across the grid) and resolved at compile time inside the repack loop.
+//
+// per_tensor == true (no ckv_scale_arr): the per-tensor ckv/kpe scales are applied
+// with one packed multiply per element pair. For a BF16 query the scale is folded
+// into the exponent-bias multiply of the FP8 -> BF16 bit-trick dequant (see
+// fast_dequant_f8f16x4): the trick yields x * 2^-120 exactly, so
+// x * bf16(scale) == (x * 2^-120) * (2^120 * bf16(scale)) with a single rounding,
+// i.e. bitwise equal to the generic path whenever 2^120 * bf16(scale) is a finite
+// BF16 (|bf16(scale)| < 256). Larger, NaN or infinite scales use the generic path.
+// For an FP16 query the per-tensor path is the generic per-tensor arithmetic
+// without the per-chunk scale-array branch.
+//
+// per_tensor == false: dequantize, then multiply by the per-(row, 128 columns)
+// ckv_scale_arr entry when it is given, else by the per-tensor scale.
+template <typename DTypeQ>
+struct FP8KVRepackScales {
+  using packed2_t = std::conditional_t<std::is_same_v<DTypeQ, half>, half2, nv_bfloat162>;
+  // fast_dequant_f8f16x4's exponent-bias offset for E4M3 -> BF16: 2^(127 - 7) = 2^120.
+  static constexpr uint32_t kBF16FromE4M3BiasBits = (120u + 127u) << 23;
+  // Largest |bf16(scale)| for which 2^120 * bf16(scale) stays a finite BF16.
+  static constexpr float kMaxFoldableScale = 256.f;
+
+  bool per_tensor;
+  packed2_t ckv_scale;  // generic path: DTypeQ(ckv_scale)
+  packed2_t kpe_scale;  // generic path: DTypeQ(kpe_scale)
+  packed2_t ckv_mul;    // per-tensor path multiplier (bias-folded for BF16)
+  packed2_t kpe_mul;
+
+  __device__ __forceinline__ FP8KVRepackScales(float ckv_scale_f, float kpe_scale_f,
+                                               const float* ckv_scale_arr) {
+    const DTypeQ ckv_q = static_cast<DTypeQ>(ckv_scale_f);
+    const DTypeQ kpe_q = static_cast<DTypeQ>(kpe_scale_f);
+    ckv_scale = packed2_t{ckv_q, ckv_q};
+    kpe_scale = packed2_t{kpe_q, kpe_q};
+    if constexpr (std::is_same_v<DTypeQ, nv_bfloat16>) {
+      const float bias = __uint_as_float(kBF16FromE4M3BiasBits);
+      const float ckv_b = __bfloat162float(ckv_q), kpe_b = __bfloat162float(kpe_q);
+      // Both products are exact in FP32 and in BF16 (power of two times a BF16) as long
+      // as they do not overflow, which kMaxFoldableScale guarantees on the folded path.
+      ckv_mul = __float2bfloat162_rn(ckv_b * bias);
+      kpe_mul = __float2bfloat162_rn(kpe_b * bias);
+      per_tensor = ckv_scale_arr == nullptr && fabsf(ckv_b) < kMaxFoldableScale &&
+                   fabsf(kpe_b) < kMaxFoldableScale;
+    } else {
+      ckv_mul = ckv_scale;
+      kpe_mul = kpe_scale;
+      per_tensor = ckv_scale_arr == nullptr;
+    }
+  }
+};
+
+template <typename KTraits, typename AttentionVariant>
+__device__ __forceinline__ FP8KVRepackScales<typename KTraits::DTypeQ> make_fp8_kv_repack_scales(
+    const AttentionVariant& variant) {
+  if constexpr (KTraits::USE_KV_REPACK) {
+    return {variant.ckv_scale, variant.kpe_scale, variant.ckv_scale_arr};
+  } else {
+    return {1.f, 1.f, nullptr};
+  }
+}
+
+// Dequantize 16 E4M3 values to DTypeQ and multiply by `mul` (FP8KVRepackScales::ckv_mul
+// or kpe_mul).
+template <typename DTypeQ>
+__device__ __forceinline__ void dequant_e4m3x16_per_tensor(
+    DTypeQ* dst, const b128_t& src, typename FP8KVRepackScales<DTypeQ>::packed2_t mul) {
+  using packed2_t = typename FP8KVRepackScales<DTypeQ>::packed2_t;
+  if constexpr (std::is_same_v<DTypeQ, nv_bfloat16>) {
+    // fast_dequant_f8f16x4<__nv_fp8_e4m3, nv_bfloat16> (sign and exponent/mantissa
+    // bits moved into BF16 positions, RIGHT_SHIFT 4, MASK 0x7F007F00) with its 2^120
+    // bias multiply replaced by `mul` (= 2^120 * bf16(scale)).
+    const uint32_t* src4 = reinterpret_cast<const uint32_t*>(&src);
+#pragma unroll
+    for (uint32_t i = 0; i < 4; ++i) {
+      const uint32_t q = __byte_perm(src4[i], src4[i], 0x1302);
+      const uint32_t lo = (q & 0x80008000u) | ((q & 0x7F007F00u) >> 4);
+      const uint32_t hi = ((q << 8) & 0x80008000u) | (((q << 8) & 0x7F007F00u) >> 4);
+      reinterpret_cast<packed2_t*>(dst)[2 * i] =
+          __hmul2(*reinterpret_cast<const packed2_t*>(&lo), mul);
+      reinterpret_cast<packed2_t*>(dst)[2 * i + 1] =
+          __hmul2(*reinterpret_cast<const packed2_t*>(&hi), mul);
+    }
+  } else {
+    vec_cast<DTypeQ, __nv_fp8_e4m3>::template cast<16>(dst, (const __nv_fp8_e4m3*)&src);
+#pragma unroll
+    for (uint32_t k = 0; k < 8; ++k) {
+      reinterpret_cast<packed2_t*>(dst)[k] = __hmul2(reinterpret_cast<packed2_t*>(dst)[k], mul);
+    }
+  }
+}
+
 // FP8 KV path: dequantize one tile of CKV/KPE from packed FP8 shmem buffers into
-// BF16 staging buffers, applying per-tensor scales. The destination layout uses
-// the same k128B swizzle as the BF16 path, so existing WGMMA descriptors work
-// unchanged after pointing them at the staging buffers.
+// BF16 staging buffers, applying the KV scales (see FP8KVRepackScales). The
+// destination layout uses the same k128B swizzle as the BF16 path, so existing
+// WGMMA descriptors work unchanged after pointing them at the staging buffers.
 //
 // Each thread reads one 16-byte chunk (16 FP8 elems) and writes two
 // 16-byte chunks (8 BF16 elems each); see the FP8 dequant idiom in prefill.cuh.
-template <typename KTraits>
+template <typename KTraits, bool PER_TENSOR_SCALE>
 __device__ __forceinline__ void repack_fp8_kv_to_bf16(
-    typename KTraits::SharedStorage* smem_storage, const uint32_t stage_idx, float ckv_scale,
-    float kpe_scale, const float* ckv_scale_arr = nullptr, uint32_t row_base = 0,
-    const typename KTraits::IdType* kv_indices = nullptr, uint_fastdiv block_size = uint_fastdiv(),
-    uint32_t packed_kv_bound = 0) {
+    typename KTraits::SharedStorage* smem_storage, const uint32_t stage_idx,
+    const FP8KVRepackScales<typename KTraits::DTypeQ>& scales, const float* ckv_scale_arr,
+    uint32_t row_base, const typename KTraits::IdType* kv_indices, uint_fastdiv block_size,
+    uint32_t packed_kv_bound) {
   using DTypeKV = typename KTraits::DTypeKV;
   using DTypeQ = typename KTraits::DTypeQ;
+  using packed2_t = typename FP8KVRepackScales<DTypeQ>::packed2_t;
   static_assert(std::is_same_v<DTypeKV, __nv_fp8_e4m3>,
                 "repack_fp8_kv_to_bf16 only supports DTypeKV == __nv_fp8_e4m3");
 
@@ -372,37 +466,43 @@ __device__ __forceinline__ void repack_fp8_kv_to_bf16(
   constexpr uint32_t HEAD_DIM_KPE = KTraits::HEAD_DIM_KPE;
   // b128 column counts (16-byte chunks per row).
   constexpr uint32_t FP8_COLS_CKV = HEAD_DIM_CKV / upcast_size<DTypeKV>();
-  constexpr uint32_t BF16_COLS_CKV = HEAD_DIM_CKV / upcast_size<DTypeQ>();
-  constexpr uint32_t BF16_COLS_KPE = HEAD_DIM_KPE / upcast_size<DTypeQ>();
   constexpr uint32_t NUM_B128_CKV = CTA_TILE_KV * FP8_COLS_CKV;
-
-  using packed2_t = std::conditional_t<std::is_same_v<DTypeQ, half>, half2, nv_bfloat162>;
-  packed2_t ckv_scale_packed{static_cast<DTypeQ>(ckv_scale), static_cast<DTypeQ>(ckv_scale)};
 
   b128_t* src_ckv = (b128_t*)smem_storage->kv_o_smem[stage_idx].ckv;
   b128_t* dst_ckv = (b128_t*)smem_storage->ckv_bf16;
-#pragma unroll
+  // Partial unroll: a full unroll (NUM_B128_CKV / num_threads = 16 chunks per thread
+  // at HEAD_DIM_CKV 512) inlines the dequant 16x at each of the three call sites and
+  // the kernel becomes instruction-fetch bound. Two chunks per iteration keep enough
+  // independent shared-memory loads in flight on the per-tensor path; the generic path
+  // (scale array or unfoldable scale) is kept rolled to limit code size.
+  constexpr uint32_t CKV_UNROLL = PER_TENSOR_SCALE ? 2 : 1;
+#pragma unroll(CKV_UNROLL)
   for (uint32_t idx = thread_id; idx < NUM_B128_CKV; idx += num_threads) {
     uint32_t row = idx / FP8_COLS_CKV, col = idx % FP8_COLS_CKV;
     b128_t packed =
         src_ckv[get_swizzle_offset<KTraits::SWIZZLE_MODE_CKV, KTraits::UPCAST_STRIDE_CKV>(row,
                                                                                           col)];
     alignas(16) DTypeQ conv[16];
-    vec_cast<DTypeQ, DTypeKV>::template cast<16>(conv, (DTypeKV*)&packed);
-    if (ckv_scale_arr) {
-      uint32_t page, off;
-      block_size.divmod(row_base + row, page, off);
-      uint32_t phys = (row_base + row) < packed_kv_bound ? kv_indices[page] * block_size + off : 0;
-      float scale =
-          ckv_scale_arr[phys * (HEAD_DIM_CKV / 128) + col / (128 / upcast_size<DTypeKV>())];
-#pragma unroll
-      for (uint32_t k = 0; k < 16; ++k) {
-        conv[k] = static_cast<DTypeQ>(static_cast<float>(conv[k]) * scale);
-      }
+    if constexpr (PER_TENSOR_SCALE) {
+      dequant_e4m3x16_per_tensor<DTypeQ>(conv, packed, scales.ckv_mul);
     } else {
+      vec_cast<DTypeQ, DTypeKV>::template cast<16>(conv, (DTypeKV*)&packed);
+      if (ckv_scale_arr) {
+        uint32_t page, off;
+        block_size.divmod(row_base + row, page, off);
+        uint32_t phys =
+            (row_base + row) < packed_kv_bound ? kv_indices[page] * block_size + off : 0;
+        float scale =
+            ckv_scale_arr[phys * (HEAD_DIM_CKV / 128) + col / (128 / upcast_size<DTypeKV>())];
 #pragma unroll
-      for (uint32_t k = 0; k < 8; ++k) {
-        ((packed2_t*)&conv[0])[k] = __hmul2(((packed2_t*)&conv[0])[k], ckv_scale_packed);
+        for (uint32_t k = 0; k < 16; ++k) {
+          conv[k] = static_cast<DTypeQ>(static_cast<float>(conv[k]) * scale);
+        }
+      } else {
+#pragma unroll
+        for (uint32_t k = 0; k < 8; ++k) {
+          ((packed2_t*)&conv[0])[k] = __hmul2(((packed2_t*)&conv[0])[k], scales.ckv_scale);
+        }
       }
     }
     dst_ckv[get_swizzle_offset<KTraits::SWIZZLE_MODE_CKV, KTraits::UPCAST_STRIDE_CKV_BF16>(
@@ -414,7 +514,6 @@ __device__ __forceinline__ void repack_fp8_kv_to_bf16(
   if constexpr (HEAD_DIM_KPE > 0) {
     constexpr uint32_t FP8_COLS_KPE = HEAD_DIM_KPE / upcast_size<DTypeKV>();
     constexpr uint32_t NUM_B128_KPE = CTA_TILE_KV * FP8_COLS_KPE;
-    packed2_t kpe_scale_packed{static_cast<DTypeQ>(kpe_scale), static_cast<DTypeQ>(kpe_scale)};
 
     b128_t* src_kpe = (b128_t*)smem_storage->kv_o_smem[stage_idx].kpe;
     b128_t* dst_kpe = (b128_t*)smem_storage->kpe_bf16;
@@ -425,16 +524,45 @@ __device__ __forceinline__ void repack_fp8_kv_to_bf16(
           src_kpe[get_swizzle_offset<KTraits::SWIZZLE_MODE_KPE_RAW, KTraits::UPCAST_STRIDE_KPE>(
               row, col)];
       alignas(16) DTypeQ conv[16];
-      vec_cast<DTypeQ, DTypeKV>::template cast<16>(conv, (DTypeKV*)&packed);
+      if constexpr (PER_TENSOR_SCALE) {
+        dequant_e4m3x16_per_tensor<DTypeQ>(conv, packed, scales.kpe_mul);
+      } else {
+        vec_cast<DTypeQ, DTypeKV>::template cast<16>(conv, (DTypeKV*)&packed);
 #pragma unroll
-      for (uint32_t k = 0; k < 8; ++k) {
-        ((packed2_t*)&conv[0])[k] = __hmul2(((packed2_t*)&conv[0])[k], kpe_scale_packed);
+        for (uint32_t k = 0; k < 8; ++k) {
+          ((packed2_t*)&conv[0])[k] = __hmul2(((packed2_t*)&conv[0])[k], scales.kpe_scale);
+        }
       }
       dst_kpe[get_swizzle_offset<KTraits::SWIZZLE_MODE_KPE, KTraits::UPCAST_STRIDE_KPE_BF16>(
           row, 2 * col)] = *(b128_t*)&conv[0];
       dst_kpe[get_swizzle_offset<KTraits::SWIZZLE_MODE_KPE, KTraits::UPCAST_STRIDE_KPE_BF16>(
           row, 2 * col + 1)] = *(b128_t*)&conv[8];
     }
+  }
+  // The staging buffers are written through the generic proxy and read by WGMMA
+  // through the async proxy: make the writes visible to the async proxy before the
+  // call site's __syncthreads() hands the buffers to the WGMMAs. Without this fence
+  // the WGMMAs can read stale staging data (observed as run-to-run differences on
+  // H200 whenever the repack's timing changes, e.g. with ckv_scale_arr).
+  cutlass::arch::fence_view_async_shared();
+}
+
+// FP8 KV path: repack one KV tile, taking the per-tensor or the generic scale path
+// (a grid-uniform branch, outside the per-chunk loop).
+template <typename KTraits>
+__device__ __forceinline__ void repack_fp8_kv_tile(
+    typename KTraits::SharedStorage* smem_storage, const uint32_t stage_idx,
+    const FP8KVRepackScales<typename KTraits::DTypeQ>& scales, const float* ckv_scale_arr,
+    uint32_t row_base, const typename KTraits::IdType* kv_indices, uint_fastdiv block_size,
+    uint32_t packed_kv_bound) {
+  if (scales.per_tensor) {
+    repack_fp8_kv_to_bf16<KTraits, /*PER_TENSOR_SCALE=*/true>(smem_storage, stage_idx, scales,
+                                                              nullptr, row_base, kv_indices,
+                                                              block_size, packed_kv_bound);
+  } else {
+    repack_fp8_kv_to_bf16<KTraits, /*PER_TENSOR_SCALE=*/false>(smem_storage, stage_idx, scales,
+                                                               ckv_scale_arr, row_base, kv_indices,
+                                                               block_size, packed_kv_bound);
   }
 }
 
@@ -1057,6 +1185,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
     PipelineState smem_pipe_read_kv;
     float s_frag[KTraits::NUM_REGS_S_FRAG];
     uint32_t p_frag[KTraits::NUM_REGS_P_FRAG];
+    // FP8 KV path: the repack's scale path depends only on kernel parameters.
+    [[maybe_unused]] const auto repack_scales = make_fp8_kv_repack_scales<KTraits>(variant);
 
 #pragma unroll 1
     for (IdType work_idx = work_indptr[blockIdx.y]; work_idx < work_indptr[blockIdx.y + 1];
@@ -1091,12 +1221,11 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
           __syncthreads();
           // Only consumer warpgroup (128 threads) dequants FP8 KV -> BF16
           // staging buffers. Producer wg passes through the d1/d2/d_end syncs.
-          repack_fp8_kv_to_bf16<KTraits>(
-              &smem_storage, smem_pipe_read_kv.index(), variant.ckv_scale, variant.kpe_scale,
-              variant.ckv_scale_arr,
-              kv_indptr * block_size + kv_start +
-                  static_cast<uint32_t>(kv_tile_idx) * KTraits::CTA_TILE_KV,
-              kv_indices, block_size, kv_indptr * block_size + kv_len);
+          repack_fp8_kv_tile<KTraits>(&smem_storage, smem_pipe_read_kv.index(), repack_scales,
+                                      variant.ckv_scale_arr,
+                                      kv_indptr * block_size + kv_start +
+                                          static_cast<uint32_t>(kv_tile_idx) * KTraits::CTA_TILE_KV,
+                                      kv_indices, block_size, kv_indptr * block_size + kv_len);
           // s2: ensures dequant is complete before any wg reads BF16 staging.
           __syncthreads();
         }
@@ -1140,12 +1269,11 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
           __syncthreads();
           // Only consumer warpgroup (128 threads) dequants FP8 KV -> BF16
           // staging buffers. Producer wg passes through the d1/d2/d_end syncs.
-          repack_fp8_kv_to_bf16<KTraits>(
-              &smem_storage, smem_pipe_read_kv.index(), variant.ckv_scale, variant.kpe_scale,
-              variant.ckv_scale_arr,
-              kv_indptr * block_size + kv_start +
-                  static_cast<uint32_t>(kv_tile_idx) * KTraits::CTA_TILE_KV,
-              kv_indices, block_size, kv_indptr * block_size + kv_len);
+          repack_fp8_kv_tile<KTraits>(&smem_storage, smem_pipe_read_kv.index(), repack_scales,
+                                      variant.ckv_scale_arr,
+                                      kv_indptr * block_size + kv_start +
+                                          static_cast<uint32_t>(kv_tile_idx) * KTraits::CTA_TILE_KV,
+                                      kv_indices, block_size, kv_indptr * block_size + kv_len);
           // s2: ensures dequant is complete before any wg reads BF16 staging.
           __syncthreads();
         }
@@ -1186,12 +1314,11 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
           __syncthreads();
           // Only consumer warpgroup (128 threads) dequants FP8 KV -> BF16
           // staging buffers. Producer wg passes through the d1/d2/d_end syncs.
-          repack_fp8_kv_to_bf16<KTraits>(
-              &smem_storage, smem_pipe_read_kv.index(), variant.ckv_scale, variant.kpe_scale,
-              variant.ckv_scale_arr,
-              kv_indptr * block_size + kv_start +
-                  static_cast<uint32_t>(kv_tile_idx) * KTraits::CTA_TILE_KV,
-              kv_indices, block_size, kv_indptr * block_size + kv_len);
+          repack_fp8_kv_tile<KTraits>(&smem_storage, smem_pipe_read_kv.index(), repack_scales,
+                                      variant.ckv_scale_arr,
+                                      kv_indptr * block_size + kv_start +
+                                          static_cast<uint32_t>(kv_tile_idx) * KTraits::CTA_TILE_KV,
+                                      kv_indices, block_size, kv_indptr * block_size + kv_len);
           // s2: ensures dequant is complete before any wg reads BF16 staging.
           __syncthreads();
         }
